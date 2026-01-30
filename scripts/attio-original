@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+#
+# attio - Attio CRM CLI wrapper
+# https://docs.attio.com/
+#
+set -euo pipefail
+
+# Load API key from environment or ~/.env
+if [[ -z "${ATTIO_API_KEY:-}" ]]; then
+  if [[ -f "$HOME/.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.env" 2>/dev/null || true
+  fi
+fi
+
+if [[ -z "${ATTIO_API_KEY:-}" ]]; then
+  echo "Error: ATTIO_API_KEY not set. Add to ~/.env or export it." >&2
+  exit 1
+fi
+
+API_BASE="https://api.attio.com/v2"
+
+# Helper: make authenticated API request
+api() {
+  local method="$1"
+  local endpoint="$2"
+  shift 2
+  curl -s -X "$method" \
+    -H "Authorization: Bearer $ATTIO_API_KEY" \
+    -H "Content-Type: application/json" \
+    "$API_BASE$endpoint" "$@"
+}
+
+# Helper: format JSON output
+fmt() {
+  if command -v jq &>/dev/null; then
+    jq -r "$@"
+  else
+    cat
+  fi
+}
+
+usage() {
+  cat <<EOF
+Attio CRM CLI
+
+Usage: attio <command> <subcommand> [args...]
+
+Commands:
+  objects list                          List available objects
+  records list <object> [limit]         List records
+  records search <object> <query>       Search records
+  records get <object> <id>             Get single record
+  records create <object> <json>        Create record
+  records update <object> <id> <json>   Update record
+  
+  lists list                            List all lists/pipelines
+  entries list <list> [limit]           List entries in a list
+  entries add <list> <object> <record_id>  Add record to list
+  
+  notes list <object> <record_id>       List notes for a record
+  notes create <object> <record_id> <title> <content>
+  
+  tasks list [--open|--completed]       List tasks
+  tasks create <content> [deadline]     Create task
+  tasks complete <task_id>              Mark task complete
+  tasks delete <task_id>                Delete task
+  
+  workspace                             Show workspace info
+
+Examples:
+  attio records search companies "Unity"
+  attio notes create companies abc-123 "Call" "Discussed pricing..."
+  attio tasks create "Follow up" "2024-02-01"
+
+EOF
+  exit 1
+}
+
+# Commands
+cmd_objects_list() {
+  api GET "/objects" | fmt '.data[] | "\(.api_slug)\t\(.singular_noun)"'
+}
+
+cmd_records_list() {
+  local object="${1:?Object required (e.g., companies, people)}"
+  local limit="${2:-25}"
+  api POST "/objects/$object/records/query" -d "{\"limit\":$limit}" | fmt '.data[] | "\(.id.record_id)\t\(.values.name[0].value // .values.name[0].full_name // .values.primary_email_address[0].email_address // "unnamed")"'
+}
+
+cmd_records_search() {
+  local object="${1:?Object required}"
+  local query="${2:?Search query required}"
+  api POST "/objects/$object/records/query" \
+    -d "{\"filter\":{\"name\":{\"$contains\":\"$query\"}},\"limit\":25}" \
+    | fmt '.data[] | "\(.id.record_id)\t\(.values.name[0].value // .values.name[0].full_name // "unnamed")"'
+}
+
+cmd_records_get() {
+  local object="${1:?Object required}"
+  local id="${2:?Record ID required}"
+  api GET "/objects/$object/records/$id" | fmt '.'
+}
+
+cmd_records_create() {
+  local object="${1:?Object required}"
+  local json="${2:?JSON data required}"
+  api POST "/objects/$object/records" -d "{\"data\":{\"values\":$json}}" | fmt '.'
+}
+
+cmd_records_update() {
+  local object="${1:?Object required}"
+  local id="${2:?Record ID required}"
+  local json="${3:?JSON data required}"
+  api PATCH "/objects/$object/records/$id" -d "{\"data\":{\"values\":$json}}" | fmt '.'
+}
+
+cmd_lists_list() {
+  api GET "/lists" | fmt '.data[] | "\(.api_slug)\t\(.name)"'
+}
+
+cmd_entries_list() {
+  local list="${1:?List slug required}"
+  local limit="${2:-25}"
+  api POST "/lists/$list/entries/query" -d "{\"limit\":$limit}" | fmt '.data[] | "\(.id.entry_id)\t\(.parent_record_id)\t\(.parent_object)"'
+}
+
+cmd_entries_add() {
+  local list="${1:?List slug required}"
+  local object="${2:?Object required}"
+  local record_id="${3:?Record ID required}"
+  api POST "/lists/$list/entries" \
+    -d "{\"data\":{\"parent_object\":\"$object\",\"parent_record_id\":\"$record_id\"}}" \
+    | fmt '.'
+}
+
+cmd_notes_list() {
+  local object="${1:?Object required}"
+  local record_id="${2:?Record ID required}"
+  api GET "/notes?parent_object=$object&parent_record_id=$record_id" \
+    | fmt '.data[] | "\(.id.note_id)\t\(.title)\t\(.created_at)"'
+}
+
+cmd_notes_create() {
+  local object="${1:?Object required}"
+  local record_id="${2:?Record ID required}"
+  local title="${3:?Title required}"
+  local content="${4:?Content required}"
+  api POST "/notes" -d "{
+    \"data\": {
+      \"parent_object\": \"$object\",
+      \"parent_record_id\": \"$record_id\",
+      \"title\": \"$title\",
+      \"format\": \"plaintext\",
+      \"content\": \"$content\"
+    }
+  }" | fmt '.'
+}
+
+cmd_tasks_list() {
+  local filter=""
+  case "${1:-}" in
+    --open) filter="?is_completed=false" ;;
+    --completed) filter="?is_completed=true" ;;
+  esac
+  api GET "/tasks$filter" | fmt '.data[] | "\(.id.task_id)\t\(.content.plaintext)\t\(.deadline_at // "no deadline")\t\(if .is_completed then "✓" else "○" end)"'
+}
+
+cmd_tasks_create() {
+  local content="${1:?Task content required}"
+  local deadline="${2:-}"
+  local deadline_json="null"
+  if [[ -n "$deadline" ]]; then
+    deadline_json="\"${deadline}T12:00:00.000Z\""
+  fi
+  api POST "/tasks" -d "{
+    \"data\": {
+      \"content\": \"$content\",
+      \"format\": \"plaintext\",
+      \"deadline_at\": $deadline_json,
+      \"is_completed\": false,
+      \"linked_records\": [],
+      \"assignees\": []
+    }
+  }" | fmt '.data | "\(.id.task_id)\t\(.content.plaintext)"'
+}
+
+cmd_tasks_complete() {
+  local task_id="${1:?Task ID required}"
+  api PATCH "/tasks/$task_id" -d '{"data":{"is_completed":true}}' | fmt '.data.id.task_id'
+}
+
+cmd_tasks_delete() {
+  local task_id="${1:?Task ID required}"
+  api DELETE "/tasks/$task_id"
+  echo "Deleted"
+}
+
+cmd_workspace() {
+  api GET "/self" | fmt '"\(.workspace_name) (\(.workspace_slug))\nID: \(.workspace_id)"'
+}
+
+# Main dispatcher
+main() {
+  [[ $# -lt 1 ]] && usage
+
+  local cmd="$1"
+  local subcmd="${2:-}"
+  shift
+  [[ $# -gt 0 ]] && shift
+
+  case "$cmd" in
+    objects)
+      case "$subcmd" in
+        list) cmd_objects_list "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    records)
+      case "$subcmd" in
+        list) cmd_records_list "$@" ;;
+        search) cmd_records_search "$@" ;;
+        get) cmd_records_get "$@" ;;
+        create) cmd_records_create "$@" ;;
+        update) cmd_records_update "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    lists)
+      case "$subcmd" in
+        list) cmd_lists_list "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    entries)
+      case "$subcmd" in
+        list) cmd_entries_list "$@" ;;
+        add) cmd_entries_add "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    notes)
+      case "$subcmd" in
+        list) cmd_notes_list "$@" ;;
+        create) cmd_notes_create "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    tasks)
+      case "$subcmd" in
+        list) cmd_tasks_list "$@" ;;
+        create) cmd_tasks_create "$@" ;;
+        complete) cmd_tasks_complete "$@" ;;
+        delete) cmd_tasks_delete "$@" ;;
+        *) usage ;;
+      esac
+      ;;
+    workspace)
+      cmd_workspace "$@"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main "$@"
