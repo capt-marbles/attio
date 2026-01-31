@@ -29,7 +29,7 @@ Get your API key: Attio → Workspace Settings → Developers → New Access Tok
 clawdhub install attio
 
 # Via GitHub
-git clone https://github.com/capt-marbles/attio ~/.clawdbot/skills/attio
+git clone https://github.com/capt-marbles/attio ~/.openclaw/skills/attio
 ```
 
 ### 3. Usage
